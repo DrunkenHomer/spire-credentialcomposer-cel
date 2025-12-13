@@ -29,14 +29,15 @@ var (
 	_ pluginsdk.NeedsLogger = (*Plugin)(nil)
 )
 
-type ConfigJWT struct {
+type ConfigCEL struct {
 	ExpressionString *string `hcl:"expression_string"`
 	ExpressionPath   *string `hcl:"expression_path"`
 	prg              cel.Program
 }
 
 type Config struct {
-	JWT               ConfigJWT `hcl:"jwt"`
+	JWT               ConfigCEL `hcl:"jwt"`
+	X509              ConfigCEL `hcl:"x509"`
 	trustDomain       string
 	spiffeTrustDomain string
 }
@@ -57,6 +58,7 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	config := new(Config)
 	config.trustDomain = req.CoreConfiguration.TrustDomain
 	config.spiffeTrustDomain = fmt.Sprintf("spiffe://%s", config.trustDomain)
+
 	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to decode configuration: %v", err)
 	}
@@ -65,31 +67,29 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		return nil, status.Errorf(codes.InvalidArgument, "you must have jwt.expression_string or jwt.expression_path defined.")
 	}
 
-	if config.JWT.ExpressionPath != nil {
-		file, err := os.Open(*config.JWT.ExpressionPath)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "Error opening file: %v", err)
-		}
-		defer func() {
-			_ = file.Close()
-		}()
-		data, err := io.ReadAll(file)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "Error reading file: %v", err)
-		}
+	if config.X509.ExpressionString == nil && config.X509.ExpressionPath == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "you must have X509.expression_string or X509.expression_path defined.")
+	}
 
-		str := string(data)
-		config.JWT.ExpressionString = &str
+	if err := loadExpressionFromPath(&config.JWT); err != nil {
+		return nil, err
+	}
+
+	if err := loadExpressionFromPath(&config.X509); err != nil {
+		return nil, err
 	}
 
 	dynType := cel.MapType(cel.DynType, cel.DynType)
 	env, err := cel.NewEnv(
 		cel.Types(&credentialcomposerv1.ComposeWorkloadJWTSVIDRequest{}),
 		cel.Types(&credentialcomposerv1.ComposeWorkloadJWTSVIDResponse{}),
+		cel.Types(&credentialcomposerv1.ComposeWorkloadX509SVIDRequest{}),
+		cel.Types(&credentialcomposerv1.ComposeWorkloadX509SVIDResponse{}),
 		cel.Types(&structpb.Struct{}),
 		cel.Variable("trust_domain", cel.StringType),
 		cel.Variable("spiffe_trust_domain", cel.StringType),
-		cel.Variable("request", cel.ObjectType("spire.plugin.server.credentialcomposer.v1.ComposeWorkloadJWTSVIDRequest")),
+		cel.Variable("jwt_request", cel.ObjectType("spire.plugin.server.credentialcomposer.v1.ComposeWorkloadJWTSVIDRequest")),
+		cel.Variable("x509_request", cel.ObjectType("spire.plugin.server.credentialcomposer.v1.ComposeWorkloadX509SVIDRequest")),
 		ext.Bindings(),
 		ext.Lists(),
 		ext.Strings(),
@@ -124,6 +124,17 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	}
 	config.JWT.prg = prg
 
+	astX509, issuesX509 := env.Compile(*config.X509.ExpressionString)
+	if issuesX509 != nil && issuesX509.Err() != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Failed to compile cel expression for X509: %v", issuesX509.Err())
+	}
+
+	prgX509, err := env.Program(astX509)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Failed to build cel program for X509: %v", err)
+	}
+	config.X509.prg = prgX509
+
 	p.setConfig(config)
 	return &configv1.ConfigureResponse{}, nil
 }
@@ -143,9 +154,27 @@ func (p *Plugin) ComposeAgentX509SVID(context.Context, *credentialcomposerv1.Com
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 
-func (p *Plugin) ComposeWorkloadX509SVID(context.Context, *credentialcomposerv1.ComposeWorkloadX509SVIDRequest) (*credentialcomposerv1.ComposeWorkloadX509SVIDResponse, error) {
-	// Intentionally not implemented.
-	return nil, status.Error(codes.Unimplemented, "not implemented")
+func (p *Plugin) ComposeWorkloadX509SVID(_ context.Context, req *credentialcomposerv1.ComposeWorkloadX509SVIDRequest) (*credentialcomposerv1.ComposeWorkloadX509SVIDResponse, error) {
+	config, err := p.getConfig()
+	if err != nil {
+		return nil, err
+	}
+	p.logger.Debug("x509 rewrite request", req)
+	out, _, err := config.X509.prg.Eval(map[string]interface{}{
+		"trust_domain":        config.trustDomain,
+		"spiffe_trust_domain": config.spiffeTrustDomain,
+		"x509_request":        req,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Failed to evaluate cel expression: %v", err)
+	}
+	respn, err := out.ConvertToNative(reflect.TypeOf(&credentialcomposerv1.ComposeWorkloadX509SVIDResponse{}))
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Failed to parse return type: %v", err)
+	}
+	resp, _ := respn.(*credentialcomposerv1.ComposeWorkloadX509SVIDResponse)
+	p.logger.Debug("x509 rewrite response", resp)
+	return resp, nil
 }
 
 func (p *Plugin) ComposeWorkloadJWTSVID(_ context.Context, req *credentialcomposerv1.ComposeWorkloadJWTSVIDRequest) (*credentialcomposerv1.ComposeWorkloadJWTSVIDResponse, error) {
@@ -157,7 +186,7 @@ func (p *Plugin) ComposeWorkloadJWTSVID(_ context.Context, req *credentialcompos
 	out, _, err := config.JWT.prg.Eval(map[string]interface{}{
 		"trust_domain":        config.trustDomain,
 		"spiffe_trust_domain": config.spiffeTrustDomain,
-		"request":             req,
+		"jwt_request":         req,
 	})
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Failed to evaluate cel expression: %v", err)
@@ -212,6 +241,26 @@ func mapOverrideEntries(args ...ref.Val) ref.Val {
 		copy[nextK] = nextV
 	}
 	return types.DefaultTypeAdapter.NativeToValue(copy)
+}
+
+func loadExpressionFromPath(config *ConfigCEL) error {
+	if config.ExpressionPath == nil {
+		return nil
+	}
+	file, err := os.Open(*config.ExpressionPath)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "Error opening file: %v", err)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "Error reading file: %v", err)
+	}
+	str := string(data)
+	config.ExpressionString = &str
+	return nil
 }
 
 func uuidgen(args ...ref.Val) ref.Val {
