@@ -43,7 +43,7 @@ changelog:
       - "^test:"
 
 kos:
-  - repository: ghcr.io/spiffe/spire-credentialcomposer-cel
+  - repository: ghcr.io/drunkenhomer/spire-credentialcomposer-cel
     tags:
       - "{{.Version}}"
       - latest
