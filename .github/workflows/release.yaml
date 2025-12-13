@@ -19,6 +19,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
       - uses: ko-build/setup-ko@v0.6
+        with:
+          KO_DOCKER_REPO: ghcr.io/drunkenhomer/spire-credentialcomposer-cel
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:

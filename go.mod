@@ -1,4 +1,4 @@
-module github.com/spiffe/spire/spire-credentialcomposer-cel
+module github.com/drunkenhomer/spire-credentialcomposer-cel
 
 go 1.24.2
 
