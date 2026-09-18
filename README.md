@@ -123,6 +123,61 @@ EOB
   }
 ```
 
+## X509 CA Expressions
+
+Optional. Set an `x509_ca` block to run a CEL expression when the server
+composes its own X509 CA certificate (`ComposeServerX509CA`). Without the block
+the plugin reports the hook as unimplemented and SPIRE keeps its default.
+
+### Environment
+
+ * x509_ca_request - spire.plugin.server.credentialcomposer.v1.ComposeServerX509CARequest
+ * trust_domain, spiffe_trust_domain - as above
+
+x509_ca_request.attributes has the following properties:
+ * subject - spire.plugin.server.credentialcomposer.v1.DistinguishedName
+ * policy_identifiers - list(string)
+ * extra_extensions - list(spire.plugin.server.credentialcomposer.v1.X509Extension)
+
+### Return
+
+`spire.plugin.server.credentialcomposer.v1.ComposeServerX509CAResponse`. As with the
+other hooks, the returned attributes replace the request attributes entirely, so
+pass through everything you do not intend to change.
+
+### Stable CA subject DN
+
+By default SPIRE appends the certificate serial number to the CA subject
+(`serialNumber=...`), so the subject DN changes on every CA rotation. Consumers
+that pin the issuer DN (for example Keycloak's `x509.casubjectdn`) need a
+stable one. This keeps the configured `ca_subject` and drops the serial:
+
+```
+  CredentialComposer "cel" {
+    plugin_cmd = "spire-credentialcomposer-cel"
+    plugin_checksum = ""
+    plugin_data {
+      jwt  { expression_string = "spire.plugin.server.credentialcomposer.v1.ComposeWorkloadJWTSVIDResponse{}" }
+      x509 { expression_string = "spire.plugin.server.credentialcomposer.v1.ComposeWorkloadX509SVIDResponse{}" }
+      x509_ca {
+        expression_string = <<EOB
+spire.plugin.server.credentialcomposer.v1.ComposeServerX509CAResponse{
+  attributes: spire.plugin.server.credentialcomposer.v1.X509CAAttributes{
+    subject: spire.plugin.server.credentialcomposer.v1.DistinguishedName{
+      country: x509_ca_request.attributes.subject.country,
+      organization: x509_ca_request.attributes.subject.organization,
+      common_name: x509_ca_request.attributes.subject.common_name
+    },
+    policy_identifiers: x509_ca_request.attributes.policy_identifiers,
+    extra_extensions: x509_ca_request.attributes.extra_extensions
+  }
+}
+EOB
+      }
+    }
+  }
+```
+
 ## CEL Hints
 
 ### Setting a variable:

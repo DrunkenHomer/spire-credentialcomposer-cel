@@ -36,8 +36,11 @@ type ConfigCEL struct {
 }
 
 type Config struct {
-	JWT               ConfigCEL `hcl:"jwt"`
-	X509              ConfigCEL `hcl:"x509"`
+	JWT  ConfigCEL `hcl:"jwt"`
+	X509 ConfigCEL `hcl:"x509"`
+	// Optional. When unset, ComposeServerX509CA stays unimplemented and the
+	// server keeps its default CA subject.
+	X509CA            ConfigCEL `hcl:"x509_ca"`
 	trustDomain       string
 	spiffeTrustDomain string
 }
@@ -85,11 +88,14 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		cel.Types(&credentialcomposerv1.ComposeWorkloadJWTSVIDResponse{}),
 		cel.Types(&credentialcomposerv1.ComposeWorkloadX509SVIDRequest{}),
 		cel.Types(&credentialcomposerv1.ComposeWorkloadX509SVIDResponse{}),
+		cel.Types(&credentialcomposerv1.ComposeServerX509CARequest{}),
+		cel.Types(&credentialcomposerv1.ComposeServerX509CAResponse{}),
 		cel.Types(&structpb.Struct{}),
 		cel.Variable("trust_domain", cel.StringType),
 		cel.Variable("spiffe_trust_domain", cel.StringType),
 		cel.Variable("jwt_request", cel.ObjectType("spire.plugin.server.credentialcomposer.v1.ComposeWorkloadJWTSVIDRequest")),
 		cel.Variable("x509_request", cel.ObjectType("spire.plugin.server.credentialcomposer.v1.ComposeWorkloadX509SVIDRequest")),
+		cel.Variable("x509_ca_request", cel.ObjectType("spire.plugin.server.credentialcomposer.v1.ComposeServerX509CARequest")),
 		ext.Bindings(),
 		ext.Lists(),
 		ext.Strings(),
@@ -135,13 +141,50 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 	}
 	config.X509.prg = prgX509
 
+	if config.X509CA.ExpressionString != nil || config.X509CA.ExpressionPath != nil {
+		if err := loadExpressionFromPath(&config.X509CA); err != nil {
+			return nil, err
+		}
+		astX509CA, issuesX509CA := env.Compile(*config.X509CA.ExpressionString)
+		if issuesX509CA != nil && issuesX509CA.Err() != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "Failed to compile cel expression for X509 CA: %v", issuesX509CA.Err())
+		}
+		prgX509CA, err := env.Program(astX509CA)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "Failed to build cel program for X509 CA: %v", err)
+		}
+		config.X509CA.prg = prgX509CA
+	}
+
 	p.setConfig(config)
 	return &configv1.ConfigureResponse{}, nil
 }
 
-func (p *Plugin) ComposeServerX509CA(context.Context, *credentialcomposerv1.ComposeServerX509CARequest) (*credentialcomposerv1.ComposeServerX509CAResponse, error) {
-	// Intentionally not implemented.
-	return nil, status.Error(codes.Unimplemented, "not implemented")
+func (p *Plugin) ComposeServerX509CA(_ context.Context, req *credentialcomposerv1.ComposeServerX509CARequest) (*credentialcomposerv1.ComposeServerX509CAResponse, error) {
+	config, err := p.getConfig()
+	if err != nil {
+		return nil, err
+	}
+	if config.X509CA.prg == nil {
+		// No x509_ca expression configured: behave as before.
+		return nil, status.Error(codes.Unimplemented, "not implemented")
+	}
+	p.logger.Debug("x509 CA rewrite request", req)
+	out, _, err := config.X509CA.prg.Eval(map[string]interface{}{
+		"trust_domain":        config.trustDomain,
+		"spiffe_trust_domain": config.spiffeTrustDomain,
+		"x509_ca_request":     req,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Failed to evaluate cel expression: %v", err)
+	}
+	respn, err := out.ConvertToNative(reflect.TypeOf(&credentialcomposerv1.ComposeServerX509CAResponse{}))
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Failed to parse return type: %v", err)
+	}
+	resp, _ := respn.(*credentialcomposerv1.ComposeServerX509CAResponse)
+	p.logger.Debug("x509 CA rewrite response", resp)
+	return resp, nil
 }
 
 func (p *Plugin) ComposeServerX509SVID(context.Context, *credentialcomposerv1.ComposeServerX509SVIDRequest) (*credentialcomposerv1.ComposeServerX509SVIDResponse, error) {
